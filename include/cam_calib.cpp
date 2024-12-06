@@ -16,8 +16,8 @@ bool CamCalib::ReadPicFromPath()
         }
         mvMatInitPics.push_back(pic);
         mvMatPostPics.push_back(pic);
-        #if DEBUG_MODE == TRUE
-        if (i == 1)
+        #if DEBUG_MODE == true
+        if (i < 0)
         {
             cv::imshow("ori img", pic);
             cv::waitKey(100);
@@ -31,13 +31,13 @@ bool CamCalib::FindCorners()
 {
     //通过棋盘格的已知信息，求角点在世界坐标系下的坐标XYZ，这里的Z=0。角点按行，从左到右，上到下编号。
     mvCornersInCheese_XYZ.clear();
-    cv::Point2f cheese_corner_XYZ;
     for (int row = 0; row < msPatternSize.height; ++row)
     {
-        cheese_corner_XYZ.y = (float)row * mfCheeseSquarHgt;
         for (int col = 0; col < msPatternSize.width; ++col)
         {
+            cv::Point2f cheese_corner_XYZ;
             cheese_corner_XYZ.x = (float)col * mfCheeseSquarLen;
+            cheese_corner_XYZ.y = (float)row * mfCheeseSquarHgt;
             mvCornersInCheese_XYZ.push_back(cheese_corner_XYZ);
         }
     }
@@ -66,8 +66,8 @@ bool CamCalib::FindCorners()
         cv::cornerSubPix(temp_mat, corners, cv::Size(11,11),
                          cv::Size(-1, -1), criteria);
 
-        mvvCornersEachImg_uv.push_back(std::move(corners)); //move: 通过将对象的右值（临时或者即将销毁的对象）引用转发给其他函数。
-        #if DEBUG_MODE == TRUE
+        mvvCornersEachImg_uv.push_back(corners); //move: 通过将对象的右值（临时或者即将销毁的对象）引用转发给其他函数。
+        #if DEBUG_MODE == true
         //棋盘格角点绘制
         cv::drawChessboardCorners(temp_mat, msPatternSize, corners, found_flag);
         std::string img_name = "corner img" + std::to_string(for_cnt);
@@ -98,20 +98,21 @@ void CamCalib::NormalizePoints(const std::vector<cv::Point2f> *points_vec,
     }
     mean_dev_x /= (double)points_vec->size();
     mean_dev_y /= (double)points_vec->size();
-    double s_x = 1.0 / mean_dev_x;
-    double s_y = 1.0 / mean_dev_y;
+    double s_x = 1.0f / mean_dev_x;
+    double s_y = 1.0f / mean_dev_y;
     norm_points_vec->clear();
-    cv::Point2f norm_p_uv;
     for (auto &p: *points_vec)
     {
+        cv::Point2f norm_p_uv;
         norm_p_uv.x = (float)(s_x * p.x - mean_x * s_x);
         norm_p_uv.y = (float)(s_y * p.y - mean_y * s_y);
         norm_points_vec->push_back(norm_p_uv);
     }
+    *T_p2pnorm = cv::Mat::eye(3, 3, CV_64F);
     T_p2pnorm->at<double>(0, 0) = s_x;
-    T_p2pnorm->at<double>(0, 1) = - mean_x * s_x;
-    T_p2pnorm->at<double>(1, 0) = s_y;
-    T_p2pnorm->at<double>(1, 1) = - mean_y * s_y;
+    T_p2pnorm->at<double>(0, 2) = - mean_x * s_x;
+    T_p2pnorm->at<double>(1, 1) = s_y;
+    T_p2pnorm->at<double>(1, 2) = - mean_y * s_y;
 }
 
 //已知像素坐标 u,v 和世界坐标 X,Y,Z 求矩阵 H ：
@@ -130,12 +131,11 @@ bool CamCalib::CalMatH()
     cv::Mat H_norm = cv::Mat(3, 3, CV_64F, cv::Scalar(0));
     cv::Mat H = cv::Mat(3, 3, CV_64F, cv::Scalar(0));
     // A * h = 0，填充 A 阵：
-    for (const auto &vec_points_uv : mvvCornersEachImg_uv)
-    {
+    for (const auto &vec_points_uv : mvvCornersEachImg_uv) {
         std::vector<cv::Point2f> vec_norm_p_uv;
         cv::Mat T_p2pnorm, T_p2pnorm_inv;
         NormalizePoints(&vec_points_uv, &vec_norm_p_uv, &T_p2pnorm);
-        cv::invert(T_P2Pnorm, T_p2pnorm_inv);
+        cv::invert(T_p2pnorm, T_p2pnorm_inv);
         if (vec_points_uv.size() < 4)
         {
             std::cerr << "corners num < 4, can't solve matrix H";
@@ -143,12 +143,12 @@ bool CamCalib::CalMatH()
         }
         cv::Mat mat_A((int)vec_points_uv.size() * 2, 9, CV_64F, cv::Scalar(0));
         //遍历每张图的角点
-        for (int i = 0; i < vec_points_uv.size(); ++i)
+        for (unsigned int i = 0; i < vec_points_uv.size(); ++i)
         {
             float X = vec_norm_P_XYZ.at(i).x;
             float Y = vec_norm_P_XYZ.at(i).y;
-            float u = vec_points_uv.at(i).x;
-            float v = vec_points_uv.at(i).y;
+            float u = vec_norm_p_uv.at(i).x;
+            float v = vec_norm_p_uv.at(i).y;
             mat_A.at<double>(2 * i, 0) = X;
             mat_A.at<double>(2 * i, 1) = Y;
             mat_A.at<double>(2 * i, 2) = 1;
@@ -163,6 +163,7 @@ bool CamCalib::CalMatH()
             mat_A.at<double>(2 * i + 1, 7) = -v * Y;
             mat_A.at<double>(2 * i + 1, 8) = -v;
         }
+//        std::cout << "mat_A:\n" << mat_A << std::endl;
         //最小二乘法求 Ah=0 ，使用 SVD 分解法求解。
         //找到 (A'*A) 最小特征值对应的 V 中的特征向量即为最小二乘解
         cv::Mat U, W, VT;   // A =UWV^T
@@ -170,7 +171,12 @@ bool CamCalib::CalMatH()
         cv::SVD::compute(mat_A, W, U, VT, cv::SVD::MODIFY_A | cv::SVD::FULL_UV);
         H_norm = VT.row(8).reshape(0, 3);
         H = T_p2pnorm_inv * H_norm * T_P2Pnorm;
-        mvMatH.push_back(H);
+//        std::cout << "T_P2Pnorm:\n" << T_P2Pnorm << std::endl;
+//        std::cout << "T_p2pnorm_inv:\n" << T_p2pnorm_inv << std::endl;
+//        std::cout << "T_p2pnorm_inv:\n" << T_p2pnorm_inv << std::endl;
+//        std::cout << "H:\n" << H << std::endl;
+//        std::cout << "H_norm:\n" << H_norm << std::endl;
+        mvMatH.push_back(std::move(H));
     }
     return true;
 }
@@ -189,6 +195,7 @@ bool CamCalib::CalVecVij(cv::Mat *vij, int i, int j, const cv::Mat *H)
     vij->at<double>(0,3) = H->at<double>(0,i) * H->at<double>(2,j) + H->at<double>(2,i) * H->at<double>(0,j),
     vij->at<double>(0,4) = H->at<double>(1,i) * H->at<double>(2,j) + H->at<double>(2,i) * H->at<double>(1,j),
     vij->at<double>(0,5) = H->at<double>(2,i) * H->at<double>(2,j);
+    return true;
 }
 
 //H_i^T * B * H_j = v_ij * b
@@ -201,8 +208,9 @@ bool CamCalib::CalIntrinsicA()
     cv::Mat v_12(1, 6, CV_64F, cv::Scalar (0));
     cv::Mat v_22(1, 6, CV_64F, cv::Scalar (0));
     cv::Mat v_temp(1, 6, CV_64F, cv::Scalar (0));
-    for (int i = 0; i < mvMatH.size(); ++i)
+    for (size_t i = 0; i < mvMatH.size(); ++i)
     {
+//        std::cout << "mvMatH_i" << mvMatH[i] << std::endl;
         cal_flag &= CalVecVij(&v_11, 1, 1, &mvMatH.at(i));
         cal_flag &= CalVecVij(&v_12, 1, 2, &mvMatH.at(i));
         cal_flag &= CalVecVij(&v_22, 2, 2, &mvMatH.at(i));
@@ -210,6 +218,7 @@ bool CamCalib::CalIntrinsicA()
         v_12.copyTo(MatV.row(2 * i));
         v_temp.copyTo(MatV.row(2 * i + 1));
     }
+//    std::cout << "MatV" << MatV << std::endl;
     cv::Mat U, W, VT;   // A =UWV^T
     // Eigen 返回的是V,列向量就是特征向量, opencv 返回的是VT，所以行向量是特征向量
     cv::SVD::compute(MatV, W, U, VT);
@@ -229,13 +238,14 @@ bool CamCalib::CalIntrinsicA()
     double u0 = gamma * v0 / beta - B13 * alpha * alpha / lambda;
     gamma = 0;
 
-    mMatIntrA.setTo(cv::Scalar(0));
+    mMatIntrA = cv::Mat::zeros(3,3, CV_64F);
     mMatIntrA.at<double>(0, 0) = alpha;
     mMatIntrA.at<double>(0, 1) = gamma;
     mMatIntrA.at<double>(0, 2) = u0;
     mMatIntrA.at<double>(1, 1) = beta;
     mMatIntrA.at<double>(1, 2) = v0;
-
+    mMatIntrA.at<double>(2, 2) = 1.0l;
+    std::cout << "mMatIntrA:\n" << mMatIntrA << std::endl;
     return cal_flag;
 }
 
@@ -291,7 +301,7 @@ void CamCalib::CalDistortK()
     double u0 = mMatIntrA.at<double>(0, 2);
     double v0 = mMatIntrA.at<double>(1, 2);
     cv::Mat mat_R = mvMatExtr_R.at(PIC_INDEX_CAL_K);
-    cv::Mat mat_t = mvMatExtr_R.at(PIC_INDEX_CAL_K);
+    cv::Mat mat_t = mvMatExtr_t.at(PIC_INDEX_CAL_K);
     const std::vector<cv::Point2f> *vec_dist_pts = &mvvCornersEachImg_uv[PIC_INDEX_CAL_K];
 
     for (const auto &p : mvCornersInCheese_XYZ)
@@ -312,7 +322,7 @@ void CamCalib::CalDistortK()
 
     cv::Mat D = cv::Mat::zeros(vec_dist_pts->size() * 2, 2, CV_64F);
     cv::Mat d = cv::Mat::zeros(vec_dist_pts->size() * 2, 1, CV_64F);
-    for (int i = 0; i < vec_dist_pts->size(); ++i)
+    for (unsigned int i = 0; i < vec_dist_pts->size(); ++i)
     {
         double r2 = vec_r2[i];
         D.at<double>(2 * i, 0) = (vec_ideal_pts[i].x - u0) * r2;
@@ -327,6 +337,7 @@ void CamCalib::CalDistortK()
     cv::Mat DTD_inverse;
     cv::invert(DT * D, DTD_inverse);
     mMatDistK = DTD_inverse * DT * d;
+    std::cout << "distort coeff: " << mMatDistK.at<double>(0, 0) << ", " << mMatDistK.at<double>(1, 0) << std::endl;
 }
 
 bool CamCalib::CalibrateByZZY()
@@ -337,6 +348,56 @@ bool CamCalib::CalibrateByZZY()
         CalIntrinsicA();
         CalExtrinsicT();
         CalDistortK();
+    }
+    return true;
+}
+
+bool CamCalib::CalibrateByOpencv()
+{
+    if (ReadPicFromPath() && FindCorners())
+    {
+        std::vector<std::vector<cv::Point3f>> vec_corners_3d;
+        vec_corners_3d.clear();
+        for (size_t i = 0; i < mvvCornersEachImg_uv.size(); ++i)
+        {
+            std::vector<cv::Point3f> corners_per_img;
+            for (const auto &p : mvCornersInCheese_XYZ)
+            {
+                cv::Point3f p_3d;
+                p_3d.x = p.x;
+                p_3d.y = p.y;
+                p_3d.z = 0.0l;
+                corners_per_img.push_back(p_3d);
+            }
+            vec_corners_3d.push_back(std::move(corners_per_img));
+        }
+        std::vector<cv::Mat> rvecs, tvecs;
+        cv::Mat K;
+        cv::Mat dist_coef;
+        cv::calibrateCamera(vec_corners_3d, mvvCornersEachImg_uv, mvMatPostPics[0].size(),
+                            K, dist_coef, rvecs, tvecs, CV_CALIB_FIX_K3 | CV_CALIB_ZERO_TANGENT_DIST);
+        std::cout << "opencv calib K:\n"
+                  << K << std::endl;
+        std::cout << "opencv calib dist_coeff:\n"
+                  << dist_coef << std::endl;
+
+        double reproj_err = 0;
+        int p_num = 0;
+        for (size_t i = 0; i < vec_corners_3d.size(); ++i)
+        {
+            std::vector<cv::Point2f> points_2d;
+            cv::projectPoints(vec_corners_3d[i], rvecs[i], tvecs[i], K,
+                              dist_coef, points_2d);
+            for (size_t j = 0; j < vec_corners_3d[i].size(); ++j)
+            {
+                const cv::Point2f &reproj_p = points_2d[j];
+                const cv::Point2f &origin_p = mvvCornersEachImg_uv[i][j];
+                reproj_err += sqrt((origin_p.x - reproj_p.x) * (origin_p.x - reproj_p.x) + (origin_p.y - reproj_p.y) * (origin_p.y - reproj_p.y));
+                ++p_num;
+            }
+        }
+        reproj_err /= static_cast<double>(p_num);
+        std::cout << "reproject error with opencv:" << reproj_err << std::endl;
     }
     return true;
 }

@@ -8,7 +8,7 @@
 #include <vector>
 #include <opencv2/opencv.hpp>
 
-#define DEBUG_MODE TRUE
+#define DEBUG_MODE false
 
 class CamCalib
 {
