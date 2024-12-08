@@ -1,6 +1,5 @@
 #include "cam_calib.hpp"
 
-
 bool CamCalib::ReadPicFromPath()
 {
     mvMatInitPics.clear();
@@ -300,8 +299,8 @@ void CamCalib::CalDistortK()
     std::vector<cv::Point2f> vec_ideal_pts;
     double u0 = mMatIntrA.at<double>(0, 2);
     double v0 = mMatIntrA.at<double>(1, 2);
-    cv::Mat mat_R = mvMatExtr_R.at(PIC_INDEX_CAL_K);
-    cv::Mat mat_t = mvMatExtr_t.at(PIC_INDEX_CAL_K);
+    cv::Mat mat_R = mvMatExtr_R[PIC_INDEX_CAL_K];
+    cv::Mat mat_t = mvMatExtr_t[PIC_INDEX_CAL_K];
     const std::vector<cv::Point2f> *vec_dist_pts = &mvvCornersEachImg_uv[PIC_INDEX_CAL_K];
 
     for (const auto &p : mvCornersInCheese_XYZ)
@@ -322,7 +321,7 @@ void CamCalib::CalDistortK()
 
     cv::Mat D = cv::Mat::zeros(vec_dist_pts->size() * 2, 2, CV_64F);
     cv::Mat d = cv::Mat::zeros(vec_dist_pts->size() * 2, 1, CV_64F);
-    for (unsigned int i = 0; i < vec_dist_pts->size(); ++i)
+    for (size_t i = 0; i < vec_dist_pts->size(); ++i)
     {
         double r2 = vec_r2[i];
         D.at<double>(2 * i, 0) = (vec_ideal_pts[i].x - u0) * r2;
@@ -340,6 +339,170 @@ void CamCalib::CalDistortK()
     std::cout << "distort coeff: " << mMatDistK.at<double>(0, 0) << ", " << mMatDistK.at<double>(1, 0) << std::endl;
 }
 
+// p_uv = K * T * P_XYZ
+void ProjectPointFromWordtoPiexel(cv::Mat const *Mat_A, cv::Mat const *Mat_R, cv::Mat const *Mat_t,
+                                  cv::Mat const *Mat_k, cv::Point3f const *P_XYZ, cv::Point2f *p_uv){
+    cv::Mat Mat_P_XYZ = cv::Mat(3, 1, CV_64F);
+    cv::Mat Mat_p_xyz = cv::Mat(3, 1, CV_64F);
+    Mat_P_XYZ.at<double>(0, 0) = P_XYZ->x;
+    Mat_P_XYZ.at<double>(1, 0) = P_XYZ->y;
+    Mat_P_XYZ.at<double>(2, 0) = P_XYZ->z;
+    cv::Mat trans_p = *Mat_R * Mat_P_XYZ + *Mat_t;
+
+    double x_dist = trans_p.at<double>(0, 0) / trans_p.at<double>(2, 0);
+    double y_dist = trans_p.at<double>(1, 0) / trans_p.at<double>(2, 0);
+    double r2 = 0.0l;//x_dist * x_dist + y_dist * y_dist;
+
+    Mat_p_xyz.at<double>(0, 0) = x_dist * (1 + Mat_k->at<double>(0,0) * r2 + Mat_k->at<double>(1,0) * r2 * r2);
+    Mat_p_xyz.at<double>(1, 0) = y_dist * (1 + Mat_k->at<double>(0,0) * r2 + Mat_k->at<double>(1,0) * r2 * r2);
+    Mat_p_xyz.at<double>(2, 0) = 1.0l;
+
+
+    p_uv->x = Mat_A->at<double>(0, 0) * Mat_p_xyz.at<double>(0, 0) + Mat_A->at<double>(0, 2);
+    p_uv->y = Mat_A->at<double>(1, 1) * Mat_p_xyz.at<double>(1, 0) + Mat_A->at<double>(1, 2);
+}
+
+//err^2 = (p_ideal.x - p.x)^2 + (p_ideal.y - p.y)^2
+double CamCalib::CalRepjErr()
+{
+    double repj_err = 0.0l;
+    int pts_num = 0;
+    for (size_t i = 0; i < mvvCornersEachImg_uv.size(); ++i){
+        for (size_t j = 0; j < mvvCornersEachImg_uv[i].size(); ++j){
+            cv::Point2f p_ideal;
+            cv::Point3f P_XYZ;
+            P_XYZ.x = mvCornersInCheese_XYZ[j].x;
+            P_XYZ.y = mvCornersInCheese_XYZ[j].y;
+            P_XYZ.z = 0.0f;
+            ProjectPointFromWordtoPiexel(&mMatIntrA, &mvMatExtr_R[i], &mvMatExtr_t[i],
+                                         &mMatDistK, &P_XYZ, &p_ideal);
+            repj_err += sqrt((p_ideal.x - mvvCornersEachImg_uv[i][j].x) * (p_ideal.x - mvvCornersEachImg_uv[i][j].x)
+                             + (p_ideal.y - mvvCornersEachImg_uv[i][j].y) * (p_ideal.y - mvvCornersEachImg_uv[i][j].y));
+            ++pts_num;
+        }
+    }
+    if (pts_num)
+        return repj_err / pts_num;
+    else
+        return 0;
+}
+
+//根据重投影误差优化内参和外参
+struct CamCalib::RepjErrCostFunctor{
+public:
+    RepjErrCostFunctor(const cv::Point2f& p_uv, const cv::Point2f& P_XY)
+                       : p_uv_(p_uv), P_XY_(P_XY) {}
+    template <typename T>
+    bool operator()(const T* const intr_para, const T* const extr_para,
+                    const T* const dist_para, T* residual) const {
+        // 构造内参矩阵
+        T fx = intr_para[0];
+        T fy = intr_para[1];
+        T cx = intr_para[2];
+        T cy = intr_para[3];
+
+        // 构造旋转矩阵和位移
+        T P_camera[3];
+        T p_3d[3] = {static_cast<T>(P_XY_.x), static_cast<T>(P_XY_.y), static_cast<T>(0)};
+        ceres::AngleAxisRotatePoint(extr_para, p_3d, P_camera);
+        P_camera[0] += extr_para[3];
+        P_camera[1] += extr_para[4];
+        P_camera[2] += extr_para[5];
+
+        // 投影到像素坐标
+        T xp = P_camera[0] / P_camera[2];
+        T yp = P_camera[1] / P_camera[2];
+
+        // 畸变修正
+        T r2 = xp * xp + yp * yp;
+        T radial_distortion = T(1.0) + dist_para[0] * r2 + dist_para[1] * r2 * r2;
+        T x_distorted = xp * radial_distortion;
+        T y_distorted = yp * radial_distortion;
+
+        // 应用内参矩阵
+        T u = fx * x_distorted + cx;
+        T v = fy * y_distorted + cy;
+
+        // 计算残差
+        residual[0] = u - T(p_uv_.x);
+        residual[1] = v - T(p_uv_.y);
+        return true;
+    }
+private:
+    const cv::Point2f p_uv_;
+    const cv::Point2f P_XY_;
+};
+
+void CamCalib::OptCaliData()
+{
+    ceres::Problem problem;
+    auto *K_para = new double[4];
+    *(K_para + 0) = mMatIntrA.at<double>(0, 0);
+    *(K_para + 1) = mMatIntrA.at<double>(1, 1);
+    *(K_para + 2) = mMatIntrA.at<double>(0, 2);
+    *(K_para + 3) = mMatIntrA.at<double>(1, 2);
+    auto *coeff_para = new double[2];
+    *(coeff_para + 0) = mMatDistK.at<double>(0, 0);
+    *(coeff_para + 1) = mMatDistK.at<double>(1, 0);
+    auto *cam_para = new double[6 * mvvCornersEachImg_uv.size()];
+    for (size_t i = 0; i < mvvCornersEachImg_uv.size(); ++i){
+        const cv::Mat &R = mvMatExtr_R[i];
+        const cv::Mat &t = mvMatExtr_t[i];
+        cv::Mat angle_axis;
+        cv::Rodrigues(R, angle_axis);
+
+        *(cam_para + 6 * i + 0) = angle_axis.at<double>(0, 0);
+        *(cam_para + 6 * i + 1) = angle_axis.at<double>(1, 0);
+        *(cam_para + 6 * i + 2) = angle_axis.at<double>(2, 0);
+        *(cam_para + 6 * i + 3) = t.at<double>(0, 0);
+        *(cam_para + 6 * i + 4) = t.at<double>(1, 0);
+        *(cam_para + 6 * i + 5) = t.at<double>(2, 0);
+        for (size_t j = 0; j < mvvCornersEachImg_uv[i].size(); ++j) {
+            const cv::Point2f &p_uv = mvvCornersEachImg_uv[i][j];
+            const cv::Point2f &P_XY = mvCornersInCheese_XYZ[j];
+            double *cam_para_now = cam_para + 6 * i;
+            ceres::CostFunction *cost_function = new ceres::AutoDiffCostFunction<RepjErrCostFunctor, 2, 4, 6, 2>(
+                                          new RepjErrCostFunctor(p_uv, P_XY));
+            problem.AddResidualBlock(cost_function, nullptr, K_para, cam_para_now, coeff_para);
+        }
+    }
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::DENSE_SCHUR;
+    options.minimizer_progress_to_stdout = true;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    std::cout << "origin K:\n" << mMatIntrA << std::endl;
+    std::cout << "origin dist_coeff\n:" << mMatDistK << std::endl;
+    mMatIntrA.at<double>(0, 0) = *(K_para + 0);
+    mMatIntrA.at<double>(1, 1) = *(K_para + 1);
+    mMatIntrA.at<double>(0, 2) = *(K_para + 2);
+    mMatIntrA.at<double>(1, 2) = *(K_para + 3);
+    mMatDistK.at<double>(0, 0) = *(coeff_para + 0);
+    mMatDistK.at<double>(1, 0) = *(coeff_para + 1);
+    std::cout << "ceres optimize K:\n" << mMatIntrA << std::endl;
+    std::cout << "ceres optimize dist_coeff:\n" << mMatDistK << std::endl;
+
+    // update R_vec, t_vec
+    for (size_t i = 0; i < mvMatExtr_R.size(); ++i)
+    {
+        double *T_para = cam_para + 6 * i;
+        cv::Mat R_rid = cv::Mat::zeros(3, 1, CV_64F);
+        R_rid.at<double>(0, 0) = *(T_para + 0);
+        R_rid.at<double>(1, 0) = *(T_para + 1);
+        R_rid.at<double>(2, 0) = *(T_para + 2);
+        cv::Mat opt_R;
+        cv::Rodrigues(R_rid, opt_R);
+        mvMatExtr_R[i] = opt_R;
+        mvMatExtr_t[i].at<double>(0, 0) = *(T_para + 3);
+        mvMatExtr_t[i].at<double>(1, 0) = *(T_para + 4);
+        mvMatExtr_t[i].at<double>(2, 0) = *(T_para + 5);
+    }
+    delete[] K_para;
+    delete[] coeff_para;
+    delete[] cam_para;
+}
+
 bool CamCalib::CalibrateByZZY()
 {
     if (ReadPicFromPath() && FindCorners())
@@ -348,6 +511,9 @@ bool CamCalib::CalibrateByZZY()
         CalIntrinsicA();
         CalExtrinsicT();
         CalDistortK();
+        double repj_err = CalRepjErr();
+        std::cout << "reproject error before ceres optimizing:" << repj_err << std::endl;
+        OptCaliData();
     }
     return true;
 }

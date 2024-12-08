@@ -1,8 +1,8 @@
 #ifndef CAL_INSTRINSIC_CAM_CALIB_HPP
 #define CAL_INSTRINSIC_CAM_CALIB_HPP
 #pragma once
-//#include <ceres/ceres.h>
-//#include "ceres/rotation.h"
+#include <ceres/ceres.h>
+#include "ceres/rotation.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,11 +10,16 @@
 
 #define DEBUG_MODE false
 
+
+void ProjectPointFromWordtoPiexel(cv::Mat const *Mat_A, cv::Mat const *Mat_R, cv::Mat const *Mat_t,
+                                  cv::Mat const *Mat_k, cv::Point3f const *P_XYZ, cv::Point2f *p_uv);
+
 class CamCalib
 {
 public:
     explicit CamCalib(std::string &path, cv::Size &pattern_size, float height, float length):
     msPicPath(path), msPatternSize(pattern_size), mfCheeseSquarHgt(height), mfCheeseSquarLen(length){}
+    struct RepjErrCostFunctor;
     bool ReadPicFromPath();
     bool FindCorners();
     void NormalizePoints(const std::vector<cv::Point2f> *points_vec,
@@ -25,6 +30,8 @@ public:
     bool CalIntrinsicA();
     bool CalExtrinsicT();
     void CalDistortK();
+    double CalRepjErr();
+    void OptCaliData();
     bool CalibrateByZZY();
     bool CalibrateByOpencv();
 
